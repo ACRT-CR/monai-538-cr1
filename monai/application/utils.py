@@ -13,9 +13,42 @@ import os
 from urllib.request import urlretrieve
 from urllib.error import URLError
 import hashlib
+import shutil
 import tarfile
 import zipfile
 from monai.utils import process_bar
+
+
+def safe_extract_member(member, extract_to):
+    """Securely verify compressed package member paths to prevent path traversal attacks"""
+    # Get member path (handle different compression formats)
+    if hasattr(member, "filename"):
+        member_path = member.filename  # zipfile
+    elif hasattr(member, "name"):
+        member_path = member.name  # tarfile
+    else:
+        member_path = str(member)
+
+    if hasattr(member, "issym") and member.issym():
+        raise ValueError(f"Symbolic link detected in archive: {member_path}")
+    if hasattr(member, "islnk") and member.islnk():
+        raise ValueError(f"Hard link detected in archive: {member_path}")
+
+    member_path = os.path.normpath(member_path)
+
+    if os.path.isabs(member_path) or ".." in member_path.split(os.sep):
+        raise ValueError(f"Unsafe path detected in archive: {member_path}")
+
+    full_path = os.path.join(extract_to, member_path)
+    full_path = os.path.normpath(full_path)
+
+    extract_root = os.path.realpath(extract_to)
+    target_real = os.path.realpath(full_path)
+    # Ensure the resolved path stays within the extraction root
+    if os.path.commonpath([extract_root, target_real]) != extract_root:
+        raise ValueError(f"Unsafe path: path traversal {member_path}")
+
+    return full_path
 
 
 def check_md5(filepath: str, md5_value: str = None):
@@ -74,6 +107,32 @@ def download_url(url: str, filepath: str, md5_value: str = None):
         )
 
 
+def _extract_zip(filepath, output_dir):
+    with zipfile.ZipFile(filepath, "r") as zip_file:
+        for member in zip_file.infolist():
+            safe_path = safe_extract_member(member, output_dir)
+            if member.is_dir():
+                continue
+            os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+            with zip_file.open(member) as source:
+                with open(safe_path, "wb") as target:
+                    shutil.copyfileobj(source, target)
+
+
+def _extract_tar(filepath, output_dir):
+    with tarfile.open(filepath, "r") as tar_file:
+        for member in tar_file.getmembers():
+            safe_path = safe_extract_member(member, output_dir)
+            if not member.isfile():
+                continue
+            os.makedirs(os.path.dirname(safe_path), exist_ok=True)
+            source = tar_file.extractfile(member)
+            if source is not None:
+                with source:
+                    with open(safe_path, "wb") as target:
+                        shutil.copyfileobj(source, target)
+
+
 def extractall(filepath: str, output_dir: str, md5_value: str = None):
     """
     Extract file to the output directory.
@@ -92,14 +151,13 @@ def extractall(filepath: str, output_dir: str, md5_value: str = None):
         return
     if not check_md5(filepath, md5_value):
         raise RuntimeError(f"MD5 check of compressed file {filepath} failed.")
+
     if filepath.endswith("zip"):
-        datafile = zipfile.open(filepath)
+        _extract_zip(filepath, output_dir)
     elif filepath.endswith("tar") or filepath.endswith("tar.gz"):
-        datafile = tarfile.open(filepath)
+        _extract_tar(filepath, output_dir)
     else:
         raise TypeError("unsupported compressed file type.")
-    datafile.extractall(output_dir)
-    datafile.close()
 
 
 def download_and_extract(url: str, filepath: str, output_dir: str, md5_value: str = None):
